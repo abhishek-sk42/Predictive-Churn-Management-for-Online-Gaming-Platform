@@ -1,0 +1,119 @@
+---
+title: "Case Assignment 8 Xbox Live"
+author: "Abhishek Kulkarni, Andrew Scott, and Isha Doshi"
+date: "2024-03-03"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+#Importing depdencies, reading, and partitioning the data into train, test, and representative dataset
+```{r}
+library(tidyr)
+library(ggplot2)
+library(dplyr)
+library(sandwich)
+library(lmtest)
+library(pROC)
+library(skimr)
+library(purrr)
+df=read.csv("xbox_live.csv")
+orig_prob=0.0872
+reweighted_prob=0.5
+df$sweight=ifelse(df$churn == 1,orig_prob / reweighted_prob,(1 - orig_prob) / (1 - reweighted_prob))
+train=df[df$training==1,]
+test=df[df$training==0,]
+rep=df[df$representative==1,]
+rep_summary=rep %>%
+  select(rural,africa,asia,europe,namerica,oceania,consldays,creditaa,ctrlrs,retired,custcare,gchange,mchange,refurb,months,mdrops,mmins,numgames,over18)%>%
+  summarise_all(list(temp_mean = mean, temp_sd = sd, temp_min = min, temp_max = max)) %>%
+  gather(stat, val) %>%
+  separate(stat, into = c("var", "stat"), sep = "_temp_") %>%
+  spread(stat, val) %>%
+  select(var, mean, sd, min, max)
+```
+
+#Training the logit model and evaluating performance
+```{r}
+#Logit1
+logit1=glm(churn~rural+africa+asia+europe+namerica+oceania+consldays+creditaa+ctrlrs+retired+custcare+gchange+mchange+refurb+months+mdrops+mmins+numgames+over18, 	
+                   family = binomial(link='logit'), 
+                   weight = sweight,
+                   data = train)
+train$logit1=predict.glm(logit1, train, type="response")
+test$logit1=predict.glm(logit1, test, type="response")
+rep$logit1=predict.glm(logit1, rep, type="response")
+
+#AUC (Overfitting test)
+print(paste("Train Logit1 AUC",auc(roc(train$churn, train$logit1))))
+print(paste("Test Logit1 AUC",auc(roc(test$churn, test$logit1))))
+
+#Summary
+coeftest(logit1, vcov = vcovHC(logit1, type="HC1"))
+
+#Comparing actual and predicted churn rates by churn probablity quantiles in the testrepresentative set
+rep$logit1_30 <- 31 - ntile(rep$logit1, 30)
+ggplot(rep) + 
+  stat_summary(aes(x = logit1_30, y = logit1, color="predicted"), fun = "mean", geom = "line") +
+  stat_summary(aes(x = logit1_30, y = churn, color="actual"), fun = "mean", geom = "line") +
+  xlab("Churn probability quantile") + 
+  ylab("Churn Probability") + 
+  theme(legend.position = c(0.8, 0.8)) + scale_colour_manual(values=c(predicted="red", actual="blue"))
+
+```
+#Identifying major drivers of churn; arranging features by importance and influence in determining churn. Adjusting odds by accounting for disparate scales of measurement for different features
+```{r}
+logit1_variablenames=variable.names(logit1)
+logit1_pvalues=coeftest(logit1, vcov = vcovHC(logit1, type="HC1"))[,4]
+logit1_oddsratios=exp(logit1$coef)
+variable_summary1=tibble(variable=logit1_variablenames,odds_ratio=logit1_oddsratios,p_value=logit1_pvalues)
+variable_summary2=slice(variable_summary1, 2:nrow(variable_summary1))
+variable_summary2=variable_summary2 %>% arrange(variable)
+variable_summary2$std_dev=rep_summary$sd
+variable_summary2$dummy=
+  ifelse(variable_summary2$variable == "age_60plus", 1,
+         ifelse(variable_summary2$variable == "cooking_addon", 1,
+                ifelse(variable_summary2$variable == "crossword_addon", 1,                
+                       ifelse(variable_summary2$variable == "educator", 1,  
+                              ifelse(variable_summary2$variable == "nyc_metro", 1,  
+                                     ifelse(variable_summary2$variable == "print_subscriber", 1,
+                                            0 ))))))
+variable_summary2$OR_2_SD=
+  ifelse(variable_summary2$dummy == 0 & variable_summary2$p_value < 0.05,
+         variable_summary2$odds_ratio ^ (2 * variable_summary2$std_dev),
+         NA)
+variable_summary2$X_orig=ifelse(variable_summary2$dummy == 1,
+                                   variable_summary2$odds_ratio,
+                                   variable_summary2$OR_2_SD)
+
+variable_summary2$X=ifelse(variable_summary2$p_value < 0.05,
+                              variable_summary2$X_orig,
+                              NA)
+
+variable_summary2$importance=ifelse(variable_summary2$X > 1,
+                                       variable_summary2$X,
+                                       1 / variable_summary2$X)
+variable_summary3=variable_summary2 %>%
+  select(variable, odds_ratio, p_value, std_dev, dummy, OR_2_SD, importance) %>%
+  arrange(variable)
+variable_summary4=variable_summary3 %>%
+  filter(p_value < 0.05) %>%
+  arrange(desc(importance))
+variable_summary5=variable_summary4 %>%
+  mutate(effect = ifelse(odds_ratio > 1, "+", "-")) %>%
+  select(variable, importance, effect)
+
+print(variable_summary5)
+```
+
+#Simulating the effect of offering 6 months of extended subscripton (lead to decrease of ~1% in churn)
+```{r}
+df$churn_prob <- predict.glm(logit1, df, type="response")
+df$months_orig <- df$months
+df$months <- df$months_orig + 6
+df$churn_prob2 <- predict.glm(logit1, df, type="response")
+df %>% filter(representative == 1) %>% select(churn_prob, churn_prob2) %>% summary()
+```
